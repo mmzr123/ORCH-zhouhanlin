@@ -1,0 +1,804 @@
+# -*- coding: utf-8 -*-
+"""
+mmlu_pro_10choice_orch_10dirs_ema_router_k2_noletter.py
+
+MMLU-Pro (10-choice A–J), 10 个方向（category），每个方向 per_dir 题：
+- 单模型基线：OPENAI / DEEPSEEK / XAI（各只调用一次）
+- VOTE：3 模型直接答 A–J，多数表决（只统计 A–J 内合法字母）
+- ORCH：EMA 路由 + 全链 K=2 自洽
+  * Panel=2：按 EMA（quality/latency/cost/stability）选前 2 进入分析面板（第 1 名兼 dispatcher & merger）
+  * 拆解：dispatcher 产出 2 个互补子问题
+  * 子问题层：对每个 (agent × 子问题) 采样 K=2，但**不输出字母**；保留两份≈500字的结构化分析文本
+  * 合并层：merger 采样 K=2，仅在此处输出最终字母（A–J），多数表决
+
+图像输出目录：plots_mmlu_pro_orch_10dirs-1110-k=2
+"""
+
+from __future__ import annotations
+import os, time, math, random, re, argparse, collections, json
+from typing import List, Dict, Tuple, Optional
+
+# ===== 必要依赖 =====
+try:
+    from datasets import load_dataset
+except Exception as e:
+    raise RuntimeError("需要安装 datasets：pip install datasets") from e
+try:
+    import numpy as np
+except Exception as e:
+    raise RuntimeError("需要安装 numpy：pip install numpy") from e
+try:
+    import matplotlib.pyplot as plt
+except Exception as e:
+    raise RuntimeError("需要安装 matplotlib：pip install matplotlib") from e
+try:
+    from sklearn.metrics import confusion_matrix
+except Exception as e:
+    raise RuntimeError("需要安装 scikit-learn：pip install scikit-learn") from e
+
+import requests
+from requests.exceptions import ReadTimeout, RequestException
+
+PLOTS_DIR = "plots_mmlu_pro_orch_10dirs-1111-k=2"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+# ===================== API 配置（用环境变量注入） =====================
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "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")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_BASE      = os.getenv("OPENAI_BASE", "https://api.openai.com/v1")
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-c181d17907ff4d848eca8225244aa67f")
+DEEPSEEK_MODEL   = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE    = os.getenv("DEEPSEEK_BASE", "https://api.deepseek.com/v1")
+
+XAI_API_KEY      = os.getenv("XAI_API_KEY", "xai-iTEf2LYg5Jvd4YIHmSmihv7gQWEv5XkiEKuzRwQ4lqBLwUsl4tndgGSnVsn6DCzBa3gRgTl0Wuuowag9")
+XAI_MODEL        = os.getenv("XAI_MODEL", "grok-2-latest")
+XAI_BASE         = os.getenv("XAI_BASE", "https://api.x.ai/v1")
+
+
+SYSTEM_PROMPT = (
+    "You are a senior reasoning agent.\n"
+    "Rules:\n"
+    "1) Answer directly.\n"
+    "2) Do NOT ask the user for more info.\n"
+    "3) No templates or meta-commentary.\n"
+    "4) Be specific, verifiable and concise.\n"
+    "5) If info is missing, make the minimum reasonable assumption and state it.\n"
+)
+
+# ===================== 自洽参数（K=2 全链） =====================
+SC_SUBQ_K        = 2      # 子问题层：每个 agent × subQ 采样 2 次（不出字母）
+SC_MERGE_K       = 2      # 最终合并层：采样 2 次多数表决
+SC_SUBQ_T        = 0.7    # 子问题层温度
+SC_MERGE_T       = 0.0    # 合并层温度
+SC_MAX_TOKENS    = 900    # 分析阶段上限（足够容纳≈500字）
+SC_MERGE_TOKENS  = 32     # 合并阶段上限（仅输出字母）
+PANEL_TOPK       = 2      # EMA 路由选前 2
+
+# ===================== EMA 配置 =====================
+EMA_STATE_PATH   = "ema_state_mmlu_pro.json"
+EMA_AGENT_NAMES  = ["OPENAI", "DEEPSEEK", "XAI"]
+EMA_ALPHA_QUALITY   = 0.2
+EMA_ALPHA_LATENCY   = 0.2
+EMA_ALPHA_COST      = 0.2
+EMA_ALPHA_STABILITY = 0.2
+
+# 价格表（按 100 万 tokens），只用于估算每次调用成本的相对大小
+PRICE_PER_M = {
+    "OPENAI":   {"currency": "USD", "input": 0.15, "output": 0.60},
+    "DEEPSEEK": {"currency": "CNY", "input": 2.0,  "output": None},
+    "XAI":      {"currency": "USD", "input": 2.0,  "output": 10.0},
+}
+
+def init_empty_ema_state(agent_names: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
+    state: Dict[str, Dict[str, Optional[float]]] = {}
+    for name in agent_names:
+        state[name] = {
+            "ema_quality": None,
+            "ema_latency_ms": None,
+            "ema_cost": None,
+            "ema_stability": None,
+        }
+    return state
+
+def load_ema_state(agent_names: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
+    if not os.path.exists(EMA_STATE_PATH):
+        state = init_empty_ema_state(agent_names)
+        with open(EMA_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        print(f"[EMA] no existing file, created new: {EMA_STATE_PATH}")
+        return state
+    try:
+        with open(EMA_STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            raise ValueError("bad json format")
+    except Exception as e:
+        print(f"[EMA] load error ({e}), re-init state.")
+        state = {}
+    # 补齐
+    for name in agent_names:
+        if name not in state or not isinstance(state[name], dict):
+            state[name] = {}
+        st = state[name]
+        for k in ["ema_quality", "ema_latency_ms", "ema_cost", "ema_stability"]:
+            if k not in st:
+                st[k] = None
+    return state
+
+def save_ema_state(state: Dict[str, Dict[str, Optional[float]]]):
+    with open(EMA_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    print(f"[EMA] state saved to {EMA_STATE_PATH}")
+
+def ema_update(old: Optional[float], x: Optional[float], alpha: float) -> Optional[float]:
+    if x is None:
+        return old
+    if old is None:
+        return float(x)
+    return float(alpha * x + (1.0 - alpha) * old)
+
+def calc_call_cost(agent_name: str,
+                   tokens_in: Optional[int],
+                   tokens_out: Optional[int]) -> Optional[float]:
+    if tokens_in is None and tokens_out is None:
+        return None
+    cfg = PRICE_PER_M.get(agent_name)
+    if cfg is None:
+        return None
+    ti = tokens_in or 0
+    to = tokens_out or 0
+    inp_price  = cfg.get("input")
+    out_price  = cfg.get("output")
+    if inp_price is None and out_price is None:
+        return None
+    if inp_price is None:
+        inp_price = 0.0
+    if out_price is None:
+        out_price = inp_price
+    cost = (ti * inp_price + to * out_price) / 1e6
+    return float(cost)
+
+def update_agent_ema(ema_state: Dict[str, Dict[str, Optional[float]]],
+                     agent_name: str,
+                     correct: Optional[bool],
+                     latency_ms: Optional[float],
+                     cost: Optional[float],
+                     stability_ok: Optional[bool]):
+    if agent_name not in ema_state:
+        return
+    st = ema_state[agent_name]
+    if correct is not None:
+        q_obs = 1.0 if correct else 0.0
+        st["ema_quality"] = ema_update(st.get("ema_quality"), q_obs, EMA_ALPHA_QUALITY)
+    if latency_ms is not None:
+        st["ema_latency_ms"] = ema_update(st.get("ema_latency_ms"), float(latency_ms), EMA_ALPHA_LATENCY)
+    if cost is not None:
+        st["ema_cost"] = ema_update(st.get("ema_cost"), float(cost), EMA_ALPHA_COST)
+    if stability_ok is not None:
+        s_obs = 1.0 if stability_ok else 0.0
+        st["ema_stability"] = ema_update(st.get("ema_stability"), s_obs, EMA_ALPHA_STABILITY)
+
+# ===================== 工具函数：A–J 归一 =====================
+A_J = [chr(ord("A") + i) for i in range(10)]
+LETTER10_RE = re.compile(r"\b([A-J])\b", re.IGNORECASE)
+
+def normalize_to_letter_10(text: str) -> str:
+    if not text:
+        return "?"
+    m = LETTER10_RE.search((text or "").strip())
+    if m:
+        return m.group(1).upper()
+    t = (text or "").strip().upper()
+    for L in A_J:
+        if re.match(rf"^\s*{L}\b", t):
+            return L
+    return "?"
+
+def sc_majority_AJ(letters: List[str]) -> str:
+    letters = [x for x in letters if x in A_J]
+    if not letters:
+        return "?"
+    cnt = collections.Counter(letters).most_common()
+    if len(cnt) == 1 or cnt[0][1] > cnt[1][1]:
+        return cnt[0][0]
+    # 字典序稳定打平
+    return sorted([x for x, n in cnt if n == cnt[0][1]])[0]
+
+# ===================== 通用 chat 调用（支持温度） =====================
+def call_chat_api(base_url: str, api_key: str, model: str,
+                  prompt: str, max_tokens: int = 64, temperature: float = 0.0
+                  ) -> Tuple[str, int, Optional[int], Optional[int], int]:
+    """
+    统一的 chat 调用，返回 (文本, 延迟 ms, tokens_in, tokens_out, http_status).
+    """
+    if not api_key:
+        fake = "[ECHO] " + prompt[:120]
+        return fake, 1000, None, None, 200
+
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+
+    t0 = time.time()
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=40)
+        dur_ms = int((time.time() - t0) * 1000)
+    except ReadTimeout:
+        dur_ms = int((time.time() - t0) * 1000)
+        return "[TIMEOUT]", dur_ms, None, None, 0
+    except RequestException as e:
+        dur_ms = int((time.time() - t0) * 1000)
+        return f"[REQUEST_ERROR] {e}", dur_ms, None, None, 0
+
+    status = resp.status_code
+    tokens_in = None
+    tokens_out = None
+
+    try:
+        data = resp.json()
+        text = (
+            data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            or ""
+        ).strip()
+        usage = data.get("usage", {})
+        tokens_in = usage.get("prompt_tokens")
+        tokens_out = usage.get("completion_tokens")
+    except Exception:
+        text = f"[HTTP {resp.status_code}] {resp.text[:200]}"
+
+    return text, dur_ms, tokens_in, tokens_out, status
+
+# ===================== 10 选一问答（基线：单次） =====================
+def ask_mcq_10choice(provider: str, prompt: str) -> Tuple[str, int, Optional[int], Optional[int], int]:
+    template = (
+        "You are given a 10-choice multiple-choice question.\n"
+        "Pick the single correct option.\n"
+        "Return only the letter A, B, C, D, E, F, G, H, I, or J.\n\n"
+        "{q}\n"
+    )
+    q = template.format(q=prompt)
+
+    if provider == "openai":
+        raw, lat, ti, to, st = call_chat_api(OPENAI_BASE, OPENAI_API_KEY, OPENAI_MODEL, q, max_tokens=16, temperature=0.0)
+    elif provider == "deepseek":
+        raw, lat, ti, to, st = call_chat_api(DEEPSEEK_BASE, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, q, max_tokens=16, temperature=0.0)
+    elif provider == "xai":
+        raw, lat, ti, to, st = call_chat_api(XAI_BASE, XAI_API_KEY, XAI_MODEL, q, max_tokens=16, temperature=0.0)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+    letter = normalize_to_letter_10(raw)
+    return letter, lat, ti, to, st
+
+# ===================== 子问题拆分 & 提示 =====================
+def decompose_subqs_k2(dispatcher: Tuple[str, str, str, str], prompt: str) -> Tuple[List[str], int]:
+    """
+    返回 (subqs[2], latency_ms)
+    dispatcher: (name, base, key, model)
+    """
+    name, base, key, model = dispatcher
+    tpl = (
+        "将下面的十选一题拆分为2个互补子问题，覆盖【概念判别/选项排除/一致性核验】（两条内综合覆盖），"
+        "每条≤40字。严格只输出两行，每行一个子问题，不要编号与其他多余内容。\n\n"
+        f"{prompt}\n"
+    )
+    raw, lat, _, _, _ = call_chat_api(base, key, model, tpl, max_tokens=96, temperature=0.0)
+    lines = [ln.strip(" -•\t") for ln in raw.splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        return lines[:2], lat
+    # fallback
+    return [
+        "关键概念与题干条件的一致性核查？",
+        "逐项排除并验证最优选项与题干匹配？",
+    ], lat
+
+def _analysis_prompt_for_subq_noletter(subq: str, full_prompt: str) -> str:
+    return (
+        "请围绕以下十选一题进行**结构化分析**，严格控制在500字以内；"
+        "按【要点】列出证据与排除逻辑，避免冗长复述，不要输出最终选项字母（A–J）。\n"
+        f"子问题：{subq}\n\n{full_prompt}\n"
+    )
+
+def _merge_prompt(full_prompt: str, analyses_bullets: str) -> str:
+    return (
+        "你将看到多名分析员对同一十选一题的分析（每个子问题有多份分析文本）。"
+        "请综合证据，仅输出最终选项字母（A/B/C/D/E/F/G/H/I/J），不得附加任何解释或其它字符。\n\n"
+        f"{full_prompt}\n\n{analyses_bullets}\n\n最终答案："
+    )
+
+# ===================== ORCH：EMA 路由 + 全链 K=2（子问题不出字母） =====================
+def ema_routing_key(agent_name: str,
+                    ema_state: Dict[str, Dict[str, Optional[float]]]) -> Tuple[float, float, float, float]:
+    st = ema_state.get(agent_name, {})
+    q    = 0.5  if st.get("ema_quality")     is None else st["ema_quality"]
+    lat  = 2000 if st.get("ema_latency_ms")  is None else st["ema_latency_ms"]
+    cost = 1.0  if st.get("ema_cost")        is None else st["ema_cost"]
+    stab = 0.5  if st.get("ema_stability")   is None else st["ema_stability"]
+    # routing_key 越小越好
+    return (-float(q), float(lat), float(cost), -float(stab))
+
+def orch_answer_with_subq_sc_k2(prompt: str,
+                                ema_state: Dict[str, Dict[str, Optional[float]]]
+                                ) -> Tuple[str, int]:
+    """
+    过程：
+      1) EMA 排序 -> 选前 2（第 1 名兼 dispatcher 和 merger）
+      2) dispatcher 生成 2 个子问题
+      3) 子问题层：每个 (Agent × 子问题) 采样 K=2，仅保留两份≈500字的分析文本（不抽字母）
+      4) 合并层：merger 对汇总后的所有分析文本执行 K=2 采样，仅输出字母；两次结果多数表决为最终答案
+    """
+    total_lat = 0
+
+    # 可用模型池
+    candidates = []
+    if OPENAI_API_KEY:
+        candidates.append(("OPENAI",   OPENAI_BASE,   OPENAI_API_KEY,   OPENAI_MODEL))
+    if DEEPSEEK_API_KEY:
+        candidates.append(("DEEPSEEK", DEEPSEEK_BASE, DEEPSEEK_API_KEY, DEEPSEEK_MODEL))
+    if XAI_API_KEY:
+        candidates.append(("XAI",      XAI_BASE,      XAI_API_KEY,      XAI_MODEL))
+    if not candidates:
+        return "?", total_lat
+
+    # 路由排序与日志
+    print("\n[ROUTER] candidate scores (before routing):")
+    for name, _, _, _ in candidates:
+        st = ema_state.get(name, {})
+        key = ema_routing_key(name, ema_state)
+        print(
+            f"  - {name:8s} | "
+            f"ema_quality={st.get('ema_quality')} | "
+            f"ema_latency_ms={st.get('ema_latency_ms')} | "
+            f"ema_cost={st.get('ema_cost')} | "
+            f"ema_stability={st.get('ema_stability')} | "
+            f"routing_key={key}"
+        )
+
+    candidates_sorted = sorted(candidates, key=lambda item: ema_routing_key(item[0], ema_state))
+    print("[ROUTER] sorted agents by routing_key (best first):")
+    for rank, (name, _, _, _) in enumerate(candidates_sorted, start=1):
+        print(f"  rank {rank}: {name}")
+
+    analysis_agents = candidates_sorted[:min(PANEL_TOPK, len(candidates_sorted))]
+    dispatcher = analysis_agents[0]
+    merger = analysis_agents[0]
+    print(f"[ROUTER] chosen analysis panel = {[a[0] for a in analysis_agents]}, "
+          f"dispatcher = {dispatcher[0]}, merger = {merger[0]}")
+
+    # 子问题拆分 (K=2 子问题)
+    subqs, lat_dec = decompose_subqs_k2(dispatcher, prompt)
+    total_lat += lat_dec
+    print(f"[DECOMPOSE] sub-questions = {subqs}")
+
+    # 子问题层：每个 agent × subQ 做 K=2，保留两份分析文本
+    analyses_per_agent: Dict[str, str] = {}
+    for (name, base, key, model) in analysis_agents:
+        per_subq_blocks = []
+        for idx, sq in enumerate(subqs, 1):
+            ana_prompt = _analysis_prompt_for_subq_noletter(sq, prompt)
+
+            raws, lat_sum = [], 0
+            for k in range(SC_SUBQ_K):
+                raw, lat, _, _, _ = call_chat_api(
+                    base, key, model, ana_prompt,
+                    max_tokens=SC_MAX_TOKENS, temperature=SC_SUBQ_T
+                )
+                lat_sum += lat
+                # 不截断或适度截断，避免过长
+                raws.append(raw.strip()[:1000])
+            total_lat += lat_sum
+
+            # 标注两个样本
+            block = []
+            for k, r in enumerate(raws, 1):
+                tag = f"(SubQ{idx} Sample{k}) "
+                block.append(tag + r)
+            per_subq_blocks.append("\n\n".join(block))
+
+            print(f"[SUBQ] agent={name} subQ{idx} -> K={SC_SUBQ_K} samples collected")
+
+        analyses_per_agent[name] = "\n\n".join(per_subq_blocks)
+
+    # 最终合并层：K=2，仅在这里输出字母
+    m_name, m_base, m_key, m_model = merger
+    bullets = "\n\n".join([f"[{name}] {txt}" for name, txt in analyses_per_agent.items()])
+    merge_prompt = _merge_prompt(prompt, bullets)
+
+    merge_letters = []
+    lat_merge_sum = 0
+    for _ in range(SC_MERGE_K):
+        merge_raw, lat_m, _, _, _ = call_chat_api(
+            m_base, m_key, m_model, merge_prompt,
+            max_tokens=SC_MERGE_TOKENS, temperature=SC_MERGE_T
+        )
+        lat_merge_sum += lat_m
+        merge_letters.append(normalize_to_letter_10(merge_raw))
+    total_lat += lat_merge_sum
+    final_letter = sc_majority_AJ(merge_letters)
+    print(f"[SC-MERGE] letters={merge_letters} -> FINAL={final_letter}")
+
+    # 若两次都解析失败，可补采一次低温重试（可选）
+    if final_letter not in A_J:
+        merge_raw2, lat_m2, _, _, _ = call_chat_api(
+            m_base, m_key, m_model, merge_prompt,
+            max_tokens=SC_MERGE_TOKENS, temperature=0.2
+        )
+        total_lat += lat_m2
+        final_letter = normalize_to_letter_10(merge_raw2)
+        print(f"[SC-MERGE-RETRY] -> FINAL={final_letter}")
+
+    return final_letter, total_lat
+
+# ===================== VOTE（A–J，只统计合法字母） =====================
+def vote_AJ(open_ans: str, deep_ans: str, xai_ans: str) -> str:
+    votes = {"OPENAI": open_ans, "DEEPSEEK": deep_ans, "XAI": xai_ans}
+    letters = {k: v for k, v in votes.items() if v in A_J}
+    if not letters:
+        return "?"
+    counter = collections.Counter(letters.values())
+    letter, cnt = counter.most_common(1)[0]
+    if cnt >= 2:
+        return letter
+    for name in ["OPENAI", "DEEPSEEK", "XAI"]:
+        cand = votes.get(name, "?")
+        if cand in A_J:
+            return cand
+    return "?"
+
+# ===================== 抽样：10 个方向，每个 per_dir 题 =====================
+def sample_mmlu_pro_10dirs(ds, per_dir: int = 30, seed: int = 42) -> Tuple[List[int], List[str]]:
+    random.seed(seed)
+    idx_all = [i for i, opts in enumerate(ds["options"])
+               if isinstance(opts, list) and len(opts) == 10]
+
+    by_cat: Dict[str, List[int]] = {}
+    for i in idx_all:
+        cat = ds["category"][i]
+        by_cat.setdefault(cat, []).append(i)
+
+    cats_sorted = sorted(by_cat.items(), key=lambda kv: len(kv[1]), reverse=True)
+    if len(cats_sorted) < 10:
+        raise RuntimeError(f"可用 category 少于 10 个，只找到：{[c for c,_ in cats_sorted]}")
+
+    chosen_cats = [cats_sorted[i][0] for i in range(10)]
+    print("[INFO] 选中的 10 个方向(category)：")
+    for c in chosen_cats:
+        print(f"  - {c} (samples with 10 options = {len(by_cat[c])})")
+
+    indices: List[int] = []
+    for c in chosen_cats:
+        pool = by_cat[c][:]
+        random.shuffle(pool)
+        indices.extend(pool[:per_dir])
+
+    return indices, chosen_cats
+
+# ===================== McNemar 计算 =====================
+def mcnemar_stats(gold: List[str], pred_a: List[str], pred_b: List[str]) -> Dict[str, float]:
+    assert len(gold) == len(pred_a) == len(pred_b)
+    b = c = 0
+    for y, pa, pb in zip(gold, pred_a, pred_b):
+        if y not in A_J:
+            continue
+        ca = (pa == y)
+        cb = (pb == y)
+        if ca and (not cb):
+            b += 1
+        elif (not ca) and cb:
+            c += 1
+    b_plus_c = b + c
+    if b_plus_c == 0:
+        return {"b": b, "c": c, "b_plus_c": 0, "chi2": 0.0, "p": 1.0}
+    chi2 = (b - c) ** 2 / float(b_plus_c)
+    p = math.erfc(math.sqrt(chi2 / 2.0))
+    return {"b": b, "c": c, "b_plus_c": b_plus_c, "chi2": chi2, "p": p}
+
+# ===================== 画图函数 =====================
+def plot_global_acc(global_acc: Dict[str, float]):
+    models = ["ORCH", "OPENAI", "DEEPSEEK", "XAI", "VOTE"]
+    accs = [global_acc[m] for m in models]
+    plt.figure(figsize=(6,4))
+    plt.bar(models, accs)
+    plt.ylim(0, 1.0)
+    plt.ylabel("Accuracy")
+    plt.title("Global Accuracy (MMLU-Pro, 10 dirs × per_dir Q, K=2)")
+    for i, v in enumerate(accs):
+        plt.text(i, v + 0.01, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+    plt.tight_layout()
+    out = os.path.join(PLOTS_DIR, "global_acc.png"); plt.savefig(out, dpi=160); plt.close()
+    print(f"[PLOT] saved -> {out}")
+
+def plot_per_direction_acc(dir_names: List[str], per_dir_acc: Dict[str, Dict[str, float]]):
+    models = ["ORCH", "OPENAI", "DEEPSEEK", "XAI", "VOTE"]
+    x = np.arange(len(dir_names)); width = 0.16
+    plt.figure(figsize=(10,5))
+    for j, m in enumerate(models):
+        ys = [per_dir_acc[d][m] for d in dir_names]
+        plt.bar(x + (j - 2)*width, ys, width, label=m)
+    plt.ylim(0, 1.0)
+    plt.xticks(x, dir_names, rotation=35, ha="right")
+    plt.ylabel("Accuracy"); plt.title("Per-Direction Accuracy (10 dirs, per_dir Q each, K=2)")
+    plt.legend(); plt.tight_layout()
+    out = os.path.join(PLOTS_DIR, "per_direction_acc.png"); plt.savefig(out, dpi=160); plt.close()
+    print(f"[PLOT] saved -> {out}")
+
+def plot_orch_confusion(golds: List[str], preds_orch: List[str]):
+    labels = A_J
+    cm = confusion_matrix(golds, preds_orch, labels=labels)
+    cm_norm = cm.astype(float) / np.clip(cm.sum(axis=1, keepdims=True), 1, None)
+    fig = plt.figure(figsize=(6.5,5)); ax = fig.add_subplot(1,1,1)
+    im = ax.imshow(cm_norm, interpolation="nearest")
+    ax.set_xticks(range(len(labels))); ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels); ax.set_yticklabels(labels)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("Gold"); ax.set_title("Confusion Matrix (ORCH, A–J, K=2)")
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            ax.text(j, i, f"{cm_norm[i, j]:.2f}", ha="center", va="center", fontsize=7)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    out = os.path.join(PLOTS_DIR, "orch_confusion.png"); plt.savefig(out, dpi=160); plt.close()
+    print(f"[PLOT] saved -> {out}")
+
+def plot_mcnemar_text(best_baseline_name: str, stats: Dict[str, float]):
+    b = stats["b"]; c = stats["c"]; bc = stats["b_plus_c"]; chi2 = stats["chi2"]; p = stats["p"]
+    txt = (
+        f"McNemar Test: ORCH vs {best_baseline_name}\n\n"
+        f"b = ORCH correct & {best_baseline_name} wrong = {b}\n"
+        f"c = ORCH wrong  & {best_baseline_name} correct = {c}\n"
+        f"b + c = {bc}\n"
+        f"chi2 = {chi2:.4f}\n"
+        f"p ≈ {p:.6f}\n\n"
+        f"Conclusion: {'significant (p < 0.05)' if p < 0.05 else 'not significant (p ≥ 0.05)'}"
+    )
+    fig, ax = plt.subplots(figsize=(6,4)); ax.axis("off")
+    ax.text(0.01, 0.99, txt, va="top", ha="left", fontsize=10, family="monospace")
+    fig.tight_layout()
+    out = os.path.join(PLOTS_DIR, "mcnemar_orch_vs_best.png"); plt.savefig(out, dpi=160); plt.close()
+    print(f"[PLOT] saved -> {out}")
+
+def plot_price_latency_table(avg_latency: Dict[str, float]):
+    header = ["Model", "In_cached", "In_noncached", "Out", "Avg latency (ms)"]
+    rows = [
+        ["ORCH (EMA-router, panel=2; subQ K=2; merge K=2)", "≈ 2×(O + D + X)", "-", "-", f"{avg_latency.get('ORCH', float('nan')):.1f}"],
+        ["VOTE (3-model)",                                   "≈ O + D + X",     "-", "-", f"{avg_latency.get('VOTE', float('nan')):.1f}"],
+        ["DEEPSEEK",                                         "0.2 元 / 1M",     "2 元 / 1M", "-", f"{avg_latency.get('DEEPSEEK', float('nan')):.1f}"],
+        ["GPT-4o-mini",                                      "$0.15 / 1M",      "$0.075 / 1M", "$0.60 / 1M", f"{avg_latency.get('OPENAI', float('nan')):.1f}"],
+        ["XAI (grok)",                                       "$2.00 / 1M",      "-", "$10.00 / 1M", f"{avg_latency.get('XAI', float('nan')):.1f}"],
+    ]
+    fig, ax = plt.subplots(figsize=(8.8, 3.0)); ax.axis("off")
+    table_data = [header] + rows
+    table = ax.table(cellText=table_data, cellLoc="center", loc="center")
+    table.auto_set_font_size(False); table.set_fontsize(9); table.scale(1, 1.4)
+    ax.set_title("Price & Average Latency", pad=10)
+    fig.tight_layout()
+    out = os.path.join(PLOTS_DIR, "price_latency_table.png"); plt.savefig(out, dpi=160); plt.close()
+    print(f"[PLOT] saved -> {out}")
+
+def plot_ema_quality_curve(ema_traj: Dict[str, Dict[str, List[Optional[float]]]]):
+    plt.figure(figsize=(7, 4))
+    for agent_name in EMA_AGENT_NAMES:
+        ys = ema_traj.get(agent_name, {}).get("ema_quality", [])
+        if not ys: continue
+        ys_plot = [np.nan if v is None else v for v in ys]
+        xs = list(range(1, len(ys_plot) + 1))
+        plt.plot(xs, ys_plot, label=agent_name)
+    plt.xlabel("Question Index"); plt.ylabel("EMA Quality (recent accuracy)")
+    plt.title("EMA Quality vs Question Index"); plt.ylim(0.0, 1.05); plt.legend(); plt.tight_layout()
+    out_path = os.path.join(PLOTS_DIR, "ema_quality_curve.png"); plt.savefig(out_path, dpi=160); plt.close()
+    print(f"[PLOT] saved -> {out_path}")
+
+# ===================== 主评测逻辑 =====================
+def main():
+    parser = argparse.ArgumentParser(
+        description="MMLU-Pro 10-choice, 10 dirs × per_dir Q, ORCH(EMA-router, subQ no-letter, K=2 chain) + 3 baselines + VOTE."
+    )
+    parser.add_argument("--per_dir", type=int, default=30, help="每个方向抽取题目数（默认 30）")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    random.seed(args.seed); np.random.seed(args.seed)
+
+    # EMA 状态
+    ema_state = load_ema_state(EMA_AGENT_NAMES)
+
+    # EMA 轨迹（用于画曲线）
+    ema_traj: Dict[str, Dict[str, List[Optional[float]]]] = {}
+    for name in EMA_AGENT_NAMES:
+        ema_traj[name] = {
+            "ema_quality": [], "ema_latency_ms": [], "ema_cost": [], "ema_stability": [],
+        }
+
+    print("[LOAD] TIGER-Lab/MMLU-Pro (split=test)")
+    ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
+
+    indices, dir_names = sample_mmlu_pro_10dirs(ds, per_dir=args.per_dir, seed=args.seed)
+    print(f"[INFO] 总样本数 ≈ {len(indices)} (10 dirs × {args.per_dir})\n")
+
+    gold_all: List[str]  = []
+    open_all: List[str]  = []
+    deep_all: List[str]  = []
+    xai_all:  List[str]  = []
+    vote_all: List[str]  = []
+    orch_all: List[str]  = []
+    dir_all:  List[str]  = []
+
+    total_lat_open = total_lat_deep = total_lat_xai = 0.0
+    total_lat_orch = total_lat_vote = 0.0
+    n_calls_open = n_calls_deep = n_calls_xai = 0
+    n_calls_orch = n_calls_vote = 0
+
+    per_dir_gold: Dict[str, List[str]] = {d: [] for d in dir_names}
+    per_dir_open: Dict[str, List[str]] = {d: [] for d in dir_names}
+    per_dir_deep: Dict[str, List[str]] = {d: [] for d in dir_names}
+    per_dir_xai:  Dict[str, List[str]] = {d: [] for d in dir_names}
+    per_dir_vote: Dict[str, List[str]] = {d: [] for d in dir_names}
+    per_dir_orch: Dict[str, List[str]] = {d: [] for d in dir_names}
+
+    for qi, i in enumerate(indices, 1):
+        q = ds["question"][i]
+        opts = ds["options"][i]
+        gold_idx = int(ds["answer_index"][i])
+        gold_letter = A_J[gold_idx] if 0 <= gold_idx < 10 else "?"
+        cat = ds["category"][i]
+
+        prompt = "Question: " + str(q).strip() + "\nOptions:\n" + \
+                 "\n".join([f"{A_J[k]}. {opts[k]}" for k in range(10)])
+
+        # ===== 单模型基线（各一次） =====
+        open_ans, lat_o, ti_o, to_o, st_o = ask_mcq_10choice("openai",  prompt)
+        deep_ans, lat_d, ti_d, to_d, st_d = ask_mcq_10choice("deepseek", prompt)
+        xai_ans,  lat_x, ti_x, to_x, st_x = ask_mcq_10choice("xai",      prompt)
+        vote_ans = vote_AJ(open_ans, deep_ans, xai_ans)
+
+        # ===== ORCH (EMA 路由 + 全链 K=2；子问题不出字母) =====
+        orch_ans, lat_orch = orch_answer_with_subq_sc_k2(prompt, ema_state)
+
+        # ===== 记录 =====
+        gold_all.append(gold_letter)
+        open_all.append(open_ans); deep_all.append(deep_ans); xai_all.append(xai_ans)
+        vote_all.append(vote_ans); orch_all.append(orch_ans); dir_all.append(cat)
+
+        # ===== 分方向 =====
+        if cat in dir_names:
+            per_dir_gold[cat].append(gold_letter)
+            per_dir_open[cat].append(open_ans)
+            per_dir_deep[cat].append(deep_ans)
+            per_dir_xai[cat].append(xai_ans)
+            per_dir_vote[cat].append(vote_ans)
+            per_dir_orch[cat].append(orch_ans)
+
+        # ===== 延迟 =====
+        total_lat_open += lat_o; total_lat_deep += lat_d; total_lat_xai += lat_x
+        total_lat_orch += lat_orch
+        lat_vote = lat_o + lat_d + lat_x; total_lat_vote += lat_vote
+
+        n_calls_open += 1; n_calls_deep += 1; n_calls_xai += 1
+        n_calls_orch += 1; n_calls_vote += 1
+
+        # ===== EMA 更新（基线驱动） =====
+        cost_open = calc_call_cost("OPENAI",   ti_o, to_o)
+        cost_deep = calc_call_cost("DEEPSEEK", ti_d, to_d)
+        cost_xai  = calc_call_cost("XAI",      ti_x, to_x)
+        stab_open = (st_o == 200); stab_deep = (st_d == 200); stab_xai = (st_x == 200)
+
+        correct_open = (open_ans == gold_letter) if (gold_letter in A_J and open_ans in A_J) else False
+        correct_deep = (deep_ans == gold_letter) if (gold_letter in A_J and deep_ans in A_J) else False
+        correct_xai  = (xai_ans  == gold_letter) if (gold_letter in A_J and xai_ans  in A_J) else False
+
+        update_agent_ema(ema_state, "OPENAI",   correct_open, lat_o, cost_open, stab_open)
+        update_agent_ema(ema_state, "DEEPSEEK", correct_deep, lat_d, cost_deep, stab_deep)
+        update_agent_ema(ema_state, "XAI",      correct_xai,  lat_x, cost_xai,  stab_xai)
+
+        # 记录 EMA 轨迹
+        for name in EMA_AGENT_NAMES:
+            st = ema_state.get(name, {})
+            for key in ["ema_quality", "ema_latency_ms", "ema_cost", "ema_stability"]:
+                # 注意：这里我们只是把轨迹记录下来方便画图，EMA 更新已在上面完成
+                # （如果需要也可以记录 ORCH 的成功与否，但这里我们以基线为信号更稳定）
+                pass
+
+        print(f"[Q{qi}/{len(indices)}] GOLD={gold_letter} | "
+              f"ORCH={orch_ans} | OPENAI={open_ans} | DEEPSEEK={deep_ans} | XAI={xai_ans} | VOTE={vote_ans}")
+
+    # ===== ACC =====
+    def acc(golds, preds):
+        ok = 0; total = 0
+        for y, p in zip(golds, preds):
+            if y not in A_J: continue
+            total += 1;  ok += int(y == p)
+        return ok / max(1, total)
+
+    global_acc = {
+        "ORCH":     acc(gold_all, orch_all),
+        "OPENAI":   acc(gold_all, open_all),
+        "DEEPSEEK": acc(gold_all, deep_all),
+        "XAI":      acc(gold_all, xai_all),
+        "VOTE":     acc(gold_all, vote_all),
+    }
+
+    print("\n[GLOBAL ACC]")
+    for k, v in global_acc.items():
+        print(f"  {k:8s} = {v:.3f}")
+
+    per_dir_acc: Dict[str, Dict[str, float]] = {}
+    print("\n[PER-DIRECTION ACC]")
+    for d in dir_names:
+        acc_orch = acc(per_dir_gold[d], per_dir_orch[d])
+        acc_open = acc(per_dir_gold[d], per_dir_open[d])
+        acc_deep = acc(per_dir_gold[d], per_dir_deep[d])
+        acc_xai  = acc(per_dir_gold[d], per_dir_xai[d])
+        acc_vote = acc(per_dir_gold[d], per_dir_vote[d])
+        per_dir_acc[d] = {"ORCH": acc_orch, "OPENAI": acc_open, "DEEPSEEK": acc_deep, "XAI": acc_xai, "VOTE": acc_vote}
+        print(f"  {d:30s} ORCH={acc_orch:.3f}  OPENAI={acc_open:.3f}  DEEPSEEK={acc_deep:.3f}  XAI={acc_xai:.3f}  VOTE={acc_vote:.3f}")
+
+    # ===== Confusion =====
+    print("\n[CONFUSION MATRIX ORCH (raw counts, A–J)]")
+    labels = A_J
+    cm = confusion_matrix(gold_all, orch_all, labels=labels)
+    header = "    " + " ".join([f"{L:>3s}" for L in labels]); print(header)
+    for i, L in enumerate(labels):
+        row = " ".join([f"{cm[i, j]:>3d}" for j in range(len(labels))])
+        print(f"{L}: {row}")
+
+    # ===== McNemar =====
+    best_base = max(["OPENAI", "DEEPSEEK", "XAI"], key=lambda m: global_acc[m])
+    best_preds = {"OPENAI": open_all, "DEEPSEEK": deep_all, "XAI": xai_all}[best_base]
+    stats = mcnemar_stats(gold_all, orch_all, best_preds)
+    print(f"\n[MCNEMAR] ORCH vs {best_base}")
+    print(f"  b = ORCH correct & {best_base} wrong = {stats['b']}")
+    print(f"  c = ORCH wrong  & {best_base} correct = {stats['c']}")
+    print(f"  b+c = {stats['b_plus_c']}, chi2 = {stats['chi2']:.4f}, p ≈ {stats['p']:.6g}")
+    if stats["p"] < 0.05:
+        print("  ==> 差异在 95% 置信水平下显著 (p < 0.05)")
+    else:
+        print("  ==> 差异在 95% 置信水平下不显著 (p ≥ 0.05)")
+
+    # ===== 平均延迟 =====
+    avg_latency = {
+        "OPENAI":   total_lat_open / max(1, n_calls_open),
+        "DEEPSEEK": total_lat_deep / max(1, n_calls_deep),
+        "XAI":      total_lat_xai  / max(1, n_calls_xai),
+        "ORCH":     total_lat_orch / max(1, n_calls_orch),
+        "VOTE":     total_lat_vote / max(1, n_calls_vote),
+    }
+    print("\n[AVG LATENCY] (ms)")
+    for k, v in avg_latency.items():
+        print(f"  {k:8s} ≈ {v:.1f} ms")
+
+    # ===== 打印每个 Agent 的最终 EMA 指标 =====
+    print("\n[EMA STATS PER AGENT]")
+    for name in EMA_AGENT_NAMES:
+        st = ema_state.get(name, {})
+        print(
+            f"  {name:8s} | "
+            f"ema_quality={st.get('ema_quality')} | "
+            f"ema_latency_ms={st.get('ema_latency_ms')} | "
+            f"ema_cost={st.get('ema_cost')} | "
+            f"ema_stability={st.get('ema_stability')}"
+        )
+
+    # ===== 保存 EMA 状态 & 作图 =====
+    save_ema_state(ema_state)
+    plot_global_acc(global_acc)
+    plot_per_direction_acc(dir_names, per_dir_acc)
+    plot_orch_confusion(gold_all, orch_all)
+    plot_mcnemar_text(best_base, stats)
+    plot_price_latency_table(avg_latency)
+    # EMA 轨迹（此版本未累加曲线值，若需要画曲线，可在上面循环中把 st.get(key) append 到 ema_traj）
+    # plot_ema_quality_curve(ema_traj)
+
+    print(f"\n[DONE] 所有图已输出到文件夹：{PLOTS_DIR}")
+
+if __name__ == "__main__":
+    main()
