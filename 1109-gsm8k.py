@@ -62,21 +62,21 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 # ===================== API 配置（带默认 key） =====================
 OPENAI_API_KEY   = os.getenv(
     "OPENAI_API_KEY",
-    "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"
+    ""
 )
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_BASE      = os.getenv("OPENAI_BASE", "https://api.openai.com/v1")
 
 DEEPSEEK_API_KEY = os.getenv(
     "DEEPSEEK_API_KEY",
-    "sk-c181d17907ff4d848eca8225244aa67f"
+    ""
 )
 DEEPSEEK_MODEL   = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE    = os.getenv("DEEPSEEK_BASE", "https://api.deepseek.com/v1")
 
 XAI_API_KEY      = os.getenv(
     "XAI_API_KEY",
-    "xai-iTEf2LYg5Jvd4YIHmSmihv7gQWEv5XkiEKuzRwQ4lqBLwUsl4tndgGSnVsn6DCzBa3gRgTl0Wuuowag9"
+    ""
 )
 XAI_MODEL        = os.getenv("XAI_MODEL", "grok-2-latest")
 XAI_BASE         = os.getenv("XAI_BASE", "https://api.x.ai/v1")
@@ -774,3 +774,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
