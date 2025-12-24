@@ -30,18 +30,18 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
 
 # =============== 基本配置 ===============
-OAI_KEY   = os.getenv("OPENAI_API_KEY",   "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")
+OAI_KEY   = os.getenv("OPENAI_API_KEY",   "")
 OAI_MODEL = os.getenv("OPENAI_MODEL",     "gpt-4o-mini")
 OAI_BASE  = os.getenv("OPENAI_BASE",      "https://api.openai.com/v1")
 
-DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "sk-c181d17907ff4d848eca8225244aa67f")
+DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL",   "deepseek-chat")
 DEEPSEEK_BASE  = os.getenv("DEEPSEEK_BASE",    "https://api.deepseek.com/v1")
 
 GROQ_KEY   = os.getenv("GROQ_API_KEY",   "")
 GROQ_MODEL = os.getenv("GROQ_MODEL",     "llama3-8b-8192")
 
-XAI_KEY   = os.getenv("XAI_API_KEY",   "xai-iTEf2LYg5Jvd4YIHmSmihv7gQWEv5XkiEKuzRwQ4lqBLwUsl4tndgGSnVsn6DCzBa3gRgTl0Wuuowag9")
+XAI_KEY   = os.getenv("XAI_API_KEY",   "")
 XAI_MODEL = os.getenv("XAI_MODEL",     "grok-2-latest")
 XAI_BASE  = os.getenv("XAI_BASE",      "https://api.x.ai/v1")
 
@@ -635,3 +635,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
